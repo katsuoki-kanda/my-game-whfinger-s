@@ -1,0 +1,329 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Hand Game - White Theme v2.3</title>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+
+    <style>
+        body { margin: 0; background: #000; color: white; font-family: sans-serif; overflow: hidden; }
+        canvas { position: absolute; left: 0; top: 0; width: 100vw; height: 100vh; object-fit: cover; transform: scaleX(-1); }
+        #ui-layer { position: absolute; width: 100%; height: 100%; pointer-events: none; }
+        
+        .hud { position: absolute; top: 20px; left: 20px; font-size: 28px; color: #0f0; text-shadow: 2px 2px 2px #000; z-index: 10; }
+        
+        .question-area { 
+            position: absolute; 
+            top: 80px; 
+            width: 100%; 
+            display: flex; 
+            justify-content: space-around; 
+            z-index: 5;
+        }
+        
+        .hand-monitor { 
+            display: flex; 
+            flex-direction: column; 
+            align-items: center; 
+            justify-content: flex-start; 
+            background: rgba(0,0,0,0.5); 
+            padding: 30px 25px 15px 25px; 
+            border-radius: 40px; 
+            min-width: 336px; 
+            min-height: 378px; 
+            border: 4px solid #555; 
+            transition: background-color 0.3s, border-color 0.3s;
+            box-sizing: border-box;
+        }
+        
+        /* 境界線のみ識別用にうっすら色を残しますが、数字は白にします */
+        #monitor-l { border-color: rgba(255, 0, 255, 0.4); }
+        #monitor-r { border-color: rgba(0, 255, 255, 0.4); }
+        
+        .monitor-correct {
+            background: rgba(255, 0, 0, 0.2);
+            border-color: #ff0000 !important;
+        }
+
+        .target-num { 
+            font-size: 192px; 
+            font-weight: bold; 
+            line-height: 0.8; 
+            margin-bottom: 10px; 
+            color: #ffffff; /* 初期色は白に統一 */
+            text-shadow: 0 0 20px rgba(255,255,255,0.3);
+            transition: color 0.2s; 
+        }
+        
+        /* 正解時のみ赤く光る */
+        .correct-highlight { 
+            color: #ff0000 !important; 
+            text-shadow: 0 0 30px rgba(255,0,0,0.8) !important; 
+        }
+        
+        .current-count { font-size: 43px; color: #fff; font-weight: bold; }
+        
+        .debug-info { 
+            font-size: 16px; 
+            color: #aaa; 
+            margin-top: 5px; 
+            height: 20px;
+        }
+
+        #msg { 
+            position: absolute; 
+            top: 12%; 
+            width: 100%; 
+            text-align: center; 
+            font-size: 70px; 
+            color: #ffff00; 
+            text-shadow: 3px 3px 5px #000; 
+            z-index: 100; 
+            pointer-events: none;
+        }
+    </style>
+</head>
+<body>
+
+    <video id="input_video" style="display:none;" playsinline></video>
+    <canvas id="output_canvas"></canvas>
+
+    <div id="ui-layer">
+        <div class="hud">
+            <div>SCORE: <span id="score">0</span></div>
+            <div>TIME: <span id="timer">60</span></div>
+        </div>
+        
+        <div id="msg">カメラ読み込み中...</div>
+
+        <div class="question-area">
+            <div id="monitor-l" class="hand-monitor">
+                <div id="target-l" class="target-num">-</div>
+                <div class="current-count">左手: <span id="cur-l">0</span></div>
+                <div id="debug-l" class="debug-info"></div>
+            </div>
+            <div id="monitor-r" class="hand-monitor">
+                <div id="target-r" class="target-num">-</div>
+                <div class="current-count">右手: <span id="cur-r">0</span></div>
+                <div id="debug-r" class="debug-info"></div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const videoElement = document.getElementById('input_video');
+        const canvasElement = document.getElementById('output_canvas');
+        const canvasCtx = canvasElement.getContext('2d');
+        
+        const scoreEl = document.getElementById('score'), timerEl = document.getElementById('timer');
+        const targetLEl = document.getElementById('target-l'), targetREl = document.getElementById('target-r');
+        const monitorLEl = document.getElementById('monitor-l'), monitorREl = document.getElementById('monitor-r');
+        const curLEl = document.getElementById('cur-l'), curREl = document.getElementById('cur-r');
+        const debugLEl = document.getElementById('debug-l'), debugREl = document.getElementById('debug-r');
+        const msgEl = document.getElementById('msg');
+
+        let score = 0, timeLeft = 60, gameActive = false;
+        let targetL = 0, targetR = 0;
+        let lastSuccessTime = 0;
+        let isFirstFrame = true;
+
+        let audioCtx = null;
+
+        function initAudioContext() {
+            if (!audioCtx) {
+                audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            }
+            if (audioCtx.state === 'suspended') {
+                audioCtx.resume();
+            }
+        }
+
+        function speak(text) {
+            window.speechSynthesis.cancel();
+            window.speechSynthesis.speak(new SpeechSynthesisUtterance(text));
+        }
+
+        function nextRound() {
+            targetLEl.classList.remove('correct-highlight');
+            targetREl.classList.remove('correct-highlight');
+            monitorLEl.classList.remove('monitor-correct');
+            monitorREl.classList.remove('monitor-correct');
+            
+            let nextL, nextR;
+            do {
+                nextL = Math.floor(Math.random() * 5) + 1;
+                nextR = Math.floor(Math.random() * 5) + 1;
+            } while (nextL === targetL && nextR === targetR);
+
+            targetL = nextL;
+            targetR = nextR;
+            targetLEl.innerText = targetL;
+            targetREl.innerText = targetR;
+        }
+
+        function startGame() {
+            if (gameActive) return;
+            initAudioContext();
+            score = 0; timeLeft = 60;
+            scoreEl.innerText = score;
+            gameActive = true;
+            msgEl.innerText = ""; 
+            speak("スタート");
+            nextRound();
+            
+            const timer = setInterval(() => {
+                if (!gameActive) { clearInterval(timer); return; }
+                timeLeft--;
+                timerEl.innerText = timeLeft;
+                if (timeLeft <= 0) {
+                    gameActive = false;
+                    msgEl.innerText = "終了！";
+                    speak(score + "点です。終了。");
+                }
+            }, 1000);
+        }
+
+        function onResults(results) {
+            if (isFirstFrame) {
+                msgEl.innerText = "手を上げてスタート";
+                isFirstFrame = false;
+            }
+
+            canvasCtx.save();
+            canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+            canvasCtx.drawImage(results.image, 0, 0, canvasElement.width, canvasElement.height);
+
+            let detectedL = 0, detectedR = 0;
+            let startTrigger = false;
+
+            curLEl.innerText = "0"; curREl.innerText = "0";
+            debugLEl.innerText = ""; debugREl.innerText = "";
+
+            if (results.multiHandLandmarks && results.multiHandedness) {
+                for (let i = 0; i < results.multiHandLandmarks.length; i++) {
+                    const landmarks = results.multiHandLandmarks[i];
+                    const label = results.multiHandedness[i].label; 
+                    const analysis = analyzeFingers(landmarks, label);
+                    const count = analysis.count;
+                    
+                    // MediaPipeのRightが物理的な「左手」として機能
+                    if (label === 'Right') {
+                        detectedL = count;
+                        curLEl.innerText = count;
+                        debugLEl.innerText = "左手:" + analysis.debug;
+                        drawConnectors(canvasCtx, landmarks, HAND_CONNECTIONS, {color: '#ff00ff', lineWidth: 2});
+                    } else {
+                        detectedR = count;
+                        curREl.innerText = count;
+                        debugREl.innerText = "右手:" + analysis.debug;
+                        drawConnectors(canvasCtx, landmarks, HAND_CONNECTIONS, {color: '#00ffff', lineWidth: 2});
+                    }
+                    drawLandmarks(canvasCtx, landmarks, {color: '#ffffff', radius: 2});
+
+                    if (landmarks[0].y < 0.3) startTrigger = true;
+                }
+            }
+
+            if (!gameActive && startTrigger) startGame();
+
+            if (gameActive) {
+                if (detectedL === targetL) {
+                    targetLEl.classList.add('correct-highlight');
+                    monitorLEl.classList.add('monitor-correct');
+                } else {
+                    targetLEl.classList.remove('correct-highlight');
+                    monitorLEl.classList.remove('monitor-correct');
+                }
+
+                if (detectedR === targetR) {
+                    targetREl.classList.add('correct-highlight');
+                    monitorREl.classList.add('monitor-correct');
+                } else {
+                    targetREl.classList.remove('correct-highlight');
+                    monitorREl.classList.remove('monitor-correct');
+                }
+
+                if (detectedL === targetL && detectedR === targetR && (Date.now() - lastSuccessTime > 1200)) {
+                    score++;
+                    scoreEl.innerText = score;
+                    msgEl.innerText = "Good!";
+                    lastSuccessTime = Date.now();
+                    playBeep();
+                    setTimeout(() => { 
+                        if(gameActive) {
+                            msgEl.innerText = "";
+                            nextRound();
+                        }
+                    }, 600);
+                }
+            }
+            canvasCtx.restore();
+        }
+
+        function analyzeFingers(lm, label) {
+            let count = 0;
+            let debug = "";
+            let isThumbUp = false;
+            // 鏡像における親指の向き判定
+            if (label === 'Right') { // ユーザーの左手
+                if (lm[4].x < lm[3].x) isThumbUp = true;
+            } else { // ユーザーの右手
+                if (lm[4].x > lm[3].x) isThumbUp = true;
+            }
+            if (isThumbUp) { count++; debug += "親● "; } else { debug += "親○ "; }
+
+            const fingers = [
+                {tip: 8, base: 6, name: "人"},
+                {tip: 12, base: 10, name: "中"},
+                {tip: 16, base: 14, name: "薬"},
+                {tip: 20, base: 18, name: "小"}
+            ];
+            fingers.forEach(f => {
+                if (lm[f.tip].y < lm[f.base].y) {
+                    count++;
+                    debug += f.name + "● ";
+                } else {
+                    debug += f.name + "○ ";
+                }
+            });
+            return { count, debug };
+        }
+
+        function playBeep() {
+            initAudioContext();
+            const osc = audioCtx.createOscillator();
+            const gain = audioCtx.createGain();
+            osc.connect(gain);
+            gain.connect(audioCtx.destination);
+            osc.frequency.value = 900;
+            osc.start();
+            const now = audioCtx.currentTime;
+            gain.gain.setValueAtTime(1, now);
+            gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.1);
+            osc.stop(now + 0.12);
+        }
+
+        const hands = new Hands({ locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}` });
+        hands.setOptions({ 
+            maxNumHands: 2, 
+            modelComplexity: 1, 
+            minDetectionConfidence: 0.7, 
+            minTrackingConfidence: 0.7 
+        });
+        hands.onResults(onResults);
+
+        const camera = new Camera(videoElement, {
+            onFrame: async () => {
+                canvasElement.width = videoElement.videoWidth;
+                canvasElement.height = videoElement.videoHeight;
+                await hands.send({image: videoElement});
+            },
+            width: 1280, height: 720
+        });
+        camera.start();
+    </script>
+</body>
+</html>
